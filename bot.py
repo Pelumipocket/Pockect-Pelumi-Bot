@@ -8,12 +8,15 @@ runs in MANUAL PASTE mode: you paste recent OHLC candles from the platform,
 the bot runs the confluence engine and replies with a signal (or an abstain).
 
 Commands:
-    /start          - welcome + instructions
+    /start          - welcome + inline pair-picker buttons
+    /pairs          - reopen the pair/timeframe button menu
     /help           - paste format + command list
-    /signal PAIR TF - set the pair/timeframe label for your next paste
+    /signal PAIR TF - set pair/timeframe by typing instead of buttons
                        e.g. /signal EURUSD-OTC 1m
     /log win|loss   - record the outcome of your last signal in this chat
     /stats          - win rate + total signals logged, this chat only
+
+Flow: tap a pair button -> tap a timeframe button -> paste candles.
 
 Paste format (send as a normal message after /signal):
     One candle per line, oldest first: open,high,low,close
@@ -31,18 +34,27 @@ import logging
 import sqlite3
 from datetime import datetime, timezone
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
 
 from signal_engine import evaluate, Direction, MIN_CANDLES
 from formatter import format_signal
+
+# common Pocket Option OTC pairs shown as buttons — edit this list to match
+# whatever's actually on your platform
+OTC_PAIRS = [
+    "EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "AUDUSD-OTC",
+    "USDCAD-OTC", "EURJPY-OTC", "USDCHF-OTC", "NZDUSD-OTC",
+]
+TIMEFRAMES = ["1m", "5m", "15m"]
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -52,6 +64,9 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = os.environ.get("DB_PATH", "signals.db")
 STAKE_AMOUNT = os.environ.get("STAKE_AMOUNT")  # optional display string, e.g. "$10"
+CHANNEL_ID = os.environ.get("CHANNEL_ID")  # optional: e.g. "@yourchannel" or "-1001234567890"
+# if set, every signal (fired or abstain) is also posted here, in addition to
+# replying in whichever chat sent the candle paste
 
 # in-memory: chat_id -> {"pair": str, "timeframe": str}
 pending_context = {}
@@ -161,16 +176,55 @@ def parse_candles(text: str):
 
 # ---------- command handlers ----------
 
+def pairs_keyboard():
+    rows = []
+    for i in range(0, len(OTC_PAIRS), 2):
+        row = [InlineKeyboardButton(p, callback_data=f"pair:{p}") for p in OTC_PAIRS[i:i + 2]]
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+def timeframe_keyboard(pair: str):
+    row = [InlineKeyboardButton(tf, callback_data=f"tf:{pair}:{tf}") for tf in TIMEFRAMES]
+    return InlineKeyboardMarkup([row])
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Confluence signal bot ready.\n\n"
-        "1. /signal PAIR TIMEFRAME  (e.g. /signal EURUSD-OTC 1m)\n"
-        "2. Paste your OHLC candles, one per line: open,high,low,close\n"
-        f"   (need at least {MIN_CANDLES} candles, oldest first)\n"
-        "3. I'll reply with a signal, or tell you why I'm staying out.\n\n"
+        "Pick a pair below, then a timeframe, then paste your OHLC candles "
+        f"(need at least {MIN_CANDLES}, oldest first, one per line: open,high,low,close).\n\n"
         "After a trade settles: /log win or /log loss\n"
         "/stats — see your win rate\n"
-        "/help — full instructions"
+        "/pairs — reopen this menu anytime",
+        reply_markup=pairs_keyboard(),
+    )
+
+
+async def pairs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Pick a pair:", reply_markup=pairs_keyboard())
+
+
+async def pair_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    pair = query.data.split(":", 1)[1]
+    await query.edit_message_text(
+        f"Pair: {pair}\nNow pick a timeframe:",
+        reply_markup=timeframe_keyboard(pair),
+    )
+
+
+async def timeframe_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, pair, timeframe = query.data.split(":", 2)
+    chat_id = query.message.chat_id
+    pending_context[chat_id] = {"pair": pair, "timeframe": timeframe}
+    await query.edit_message_text(
+        f"Set to {pair} · {timeframe}.\n\n"
+        f"Now paste your OHLC candles (need at least {MIN_CANDLES}, oldest first, "
+        "one per line: open,high,low,close)."
     )
 
 
@@ -180,7 +234,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "One candle per line, oldest first:\n"
         "<code>open,high,low,close</code>\n\n"
         "<b>Commands</b>\n"
-        "/signal PAIR TIMEFRAME — label your next paste, e.g. /signal EURUSD-OTC 1m\n"
+        "/pairs — pick a pair + timeframe with buttons\n"
+        "/signal PAIR TIMEFRAME — set it by typing instead, e.g. /signal EURUSD-OTC 1m\n"
         "/log win — mark your last signal a win\n"
         "/log loss — mark your last signal a loss\n"
         "/stats — win rate for this chat\n\n"
@@ -216,6 +271,15 @@ async def handle_paste(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = format_signal(result, ctx["pair"], ctx["timeframe"], STAKE_AMOUNT)
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+
+    if CHANNEL_ID and str(chat_id) != str(CHANNEL_ID):
+        try:
+            await context.bot.send_message(chat_id=CHANNEL_ID, text=msg, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            logger.error(f"Failed to post to channel {CHANNEL_ID}: {e}")
+            await update.message.reply_text(
+                f"⚠️ Couldn't post to the channel — make sure the bot is an admin there. ({e})"
+            )
 
     signal_id = save_signal(chat_id, ctx["pair"], ctx["timeframe"], result)
     if result.direction != Direction.ABSTAIN:
@@ -256,9 +320,12 @@ def main():
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("pairs", pairs_cmd))
     app.add_handler(CommandHandler("signal", signal_cmd))
     app.add_handler(CommandHandler("log", log_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CallbackQueryHandler(pair_button, pattern=r"^pair:"))
+    app.add_handler(CallbackQueryHandler(timeframe_button, pattern=r"^tf:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_paste))
 
     logger.info("Bot starting (manual paste mode — Pocket Option OTC has no live API)")
