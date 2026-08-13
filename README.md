@@ -1,4 +1,3 @@
-# Pockect-Pelumi-Bot
 Pocket Option OTC Signal Bot
 Telegram bot for an EMA + RSI + volatility confluence engine. Runs in
 manual paste mode: Pocket Option OTC pairs are a synthetic feed with no
@@ -37,8 +36,18 @@ Select this repo
 Railway auto-detects Python + the `Procfile` and runs `python bot.py` as a worker
 In the Railway project → Variables, add:
 `BOT_TOKEN` = your token from BotFather
+`CHANNEL_ID` (optional) = your channel, see below
 `STAKE_AMOUNT` (optional) = e.g. `$10`
 Deploy. Check the Logs tab for `Bot starting (manual paste mode...)`
+Posting signals to a Telegram channel
+Create a channel in Telegram: pencil icon → New Channel → name it → Public or Private
+Open the channel → Manage Channel → Administrators → Add Admin → search for your bot's username → add it, with Post Messages enabled
+Get the channel ID:
+Public channel → use `@yourchannelusername`
+Private channel → forward any message from it to @RawDataBot or @userinfobot, which will show a numeric ID like `-1001234567890`
+Set `CHANNEL_ID` to that value in Railway's Variables tab
+Once set, every signal (fired or abstain) posts to the channel automatically, in
+addition to replying wherever the candles were pasted.
 Persisting outcome logs across deploys
 Railway's default filesystem is ephemeral — `signals.db` resets on every
 redeploy. If you want win/loss history to survive redeploys, attach a
